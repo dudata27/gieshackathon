@@ -366,6 +366,57 @@ CUSTOM_CSS = f"""
         padding: 16px;
         margin-top: 12px;
     }}
+
+    /* Radio labels in the main area */
+    .stRadio > label,
+    div[data-testid="stMarkdownContainer"] p {{
+        color: {ILLINI_BLUE} !important;
+    }}
+    .stRadio div[role="radiogroup"] label {{
+        color: {ILLINI_BLUE} !important;
+        font-weight: 500 !important;
+        font-size: 14px !important;
+    }}
+    .stRadio div[role="radiogroup"] label p {{
+        color: {ILLINI_BLUE} !important;
+    }}
+    /* But keep sidebar radios white */
+    [data-testid="stSidebar"] .stRadio label,
+    [data-testid="stSidebar"] .stRadio label p {{
+        color: white !important;
+    }}
+
+    /* File uploader styling */
+    .stFileUploader label {{
+        color: {ILLINI_BLUE} !important;
+    }}
+    .stFileUploader > div {{
+        background: white !important;
+        border: 2px dashed {ILLINI_BLUE} !important;
+        border-radius: 8px !important;
+    }}
+
+    /* Selectbox */
+    .stSelectbox label,
+    .stSelectbox label p {{
+        color: {ILLINI_BLUE} !important;
+    }}
+
+    /* Text area styling */
+    .stTextArea textarea {{
+        background: white !important;
+        color: {ILLINI_BLUE} !important;
+        border: 2px solid {ILLINI_BLUE} !important;
+        border-radius: 6px !important;
+        font-size: 14px !important;
+    }}
+    .stTextArea textarea::placeholder {{
+        color: #9CA3AF !important;
+    }}
+    .stTextArea label,
+    .stTextArea label p {{
+        color: {ILLINI_BLUE} !important;
+    }}
 </style>
 """
 
@@ -897,7 +948,14 @@ def main():
             )
             if st.button("Score this posting", key="score_text_btn"):
                 if posting_text and posting_text.strip():
-                    score_target = ("Pasted posting", posting_text.strip(), False)
+                    text = posting_text.strip()
+                    # Auto-detect: if user pasted just a BT-ID, treat as ID lookup
+                    import re as _re
+                    id_match = _re.match(r"^(BT-\d+)\s*$", text, _re.IGNORECASE)
+                    if id_match:
+                        score_target = (id_match.group(1).upper(), id_match.group(1).upper(), True)
+                    else:
+                        score_target = ("Pasted posting", text, False)
                 else:
                     st.warning("Please paste a job posting first.")
 
