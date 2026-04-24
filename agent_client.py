@@ -94,21 +94,74 @@ class CopilotStudioAgent:
         self.watermark = data.get("watermark", self.watermark)
         return data.get("activities", [])
 
+    def _is_prompt_echo(self, text: str) -> bool:
+        """Detect when the bot message is just an echo of our fx formula."""
+        if not text:
+            return True
+        # Strong echo markers — these are in our fx formulas, not in scorecard output
+        echo_markers = [
+            "ROUTING:",
+            "OVERRIDE RULES:",
+            "Do not add preamble",
+            "Do not add any preamble",
+            "produce a scorecard in this exact format",
+            "Start the response directly with the company name",
+            "Start directly with the company name",
+            "INPUT: ",
+            "Score the following input against",
+            "Explain the score for the following input",
+            "Apply a score override against",
+            "[Company Name]",
+            "[Role Title]",
+            "[Yes/No]",
+        ]
+        for m in echo_markers:
+            if m in text:
+                return True
+        return False
+
+    def _looks_like_scorecard(self, text: str) -> bool:
+        """Detect when a bot message looks like the actual final answer."""
+        if not text or len(text) < 50:
+            return False
+        if self._is_prompt_echo(text):
+            return False
+        # Real scorecard signals: has a numeric score + tier + quotes from posting
+        indicators = [
+            "TIER:",
+            "Tier:",
+            "FIT SCORE",
+            "Fit Score",
+            "SIGNALS",
+            "RATIONALE",
+            "Rationale",
+            "SYNTHESIS",
+            "Signal-by-Signal",
+            "SCORE MATH",
+            "Score Math",
+            "Recommended Owner",
+            "SIGNAL-BY-SIGNAL",
+            "FIT BREAKDOWN",
+            "First strategic hire:",
+            "First Strategic Hire:",
+        ]
+        hits = sum(1 for ind in indicators if ind in text)
+        return hits >= 2
+
     def wait_for_bot_reply(
         self,
         user_id: str = "streamlit-user",
-        max_wait_sec: int = 45,
+        max_wait_sec: int = 60,
         poll_interval_sec: float = 1.0,
-        stop_on_question: bool = True,
     ) -> str:
         """
-        Poll for bot responses until we get one or timeout.
-        Returns the concatenated text of all bot messages.
-        If stop_on_question=False, keep collecting past short question-style replies.
+        Poll for bot responses. Skip fx prompt echoes. Wait for a real scorecard
+        or clarifying question before returning.
         """
         end_at = time.time() + max_wait_sec
-        collected = []
-        saw_bot_reply = False
+        scorecard_parts = []
+        question_parts = []
+        last_real_reply_time = None
 
         while time.time() < end_at:
             activities = self.get_activities()
@@ -117,35 +170,48 @@ class CopilotStudioAgent:
                     continue
                 from_id = (act.get("from") or {}).get("id", "")
                 if from_id == user_id:
-                    continue  # echo of our own message
+                    continue
                 text = act.get("text")
-                if text:
-                    collected.append(text)
-                    saw_bot_reply = True
+                if not text:
+                    continue
 
-            if saw_bot_reply:
-                # Wait briefly for any trailing parts then stop
-                time.sleep(1.5)
-                extras = self.get_activities()
-                for act in extras:
-                    if act.get("type") != "message":
-                        continue
-                    from_id = (act.get("from") or {}).get("id", "")
-                    if from_id == user_id:
-                        continue
-                    text = act.get("text")
-                    if text:
-                        collected.append(text)
-                break
+                # Skip prompt echoes entirely
+                if self._is_prompt_echo(text):
+                    continue
+
+                # If it's a real scorecard, collect it
+                if self._looks_like_scorecard(text):
+                    scorecard_parts.append(text)
+                    last_real_reply_time = time.time()
+                elif len(text) < 400:
+                    # Likely a clarifying question
+                    question_parts.append(text)
+                    last_real_reply_time = time.time()
+                else:
+                    # Long content that doesn't look like echo — take it
+                    scorecard_parts.append(text)
+                    last_real_reply_time = time.time()
+
+            # If we have a scorecard and haven't seen new content in 3 seconds, we're done
+            if scorecard_parts and last_real_reply_time and (time.time() - last_real_reply_time) > 3:
+                return "\n\n".join(scorecard_parts)
+
+            # If we have a question and haven't seen new content in 2 seconds, return it
+            if question_parts and last_real_reply_time and (time.time() - last_real_reply_time) > 2:
+                return "\n\n".join(question_parts)
 
             time.sleep(poll_interval_sec)
 
-        if not collected:
-            raise DirectLineError(f"No bot reply within {max_wait_sec}s")
+        if scorecard_parts:
+            return "\n\n".join(scorecard_parts)
+        if question_parts:
+            return "\n\n".join(question_parts)
+        raise DirectLineError(
+            f"No meaningful bot reply within {max_wait_sec}s "
+            f"(only prompt echoes or empty activities received)"
+        )
 
-        return "\n\n".join(collected)
-
-    def ask(self, prompt: str, max_wait_sec: int = 45, max_turns: int = 3) -> str:
+    def ask(self, prompt: str, max_wait_sec: int = 90, max_turns: int = 3) -> str:
         """
         Send a prompt, wait for the bot's reply.
         Handles multi-turn: if bot asks a clarifying question, we auto-reply with
@@ -158,13 +224,10 @@ class CopilotStudioAgent:
         self.send_message(prompt)
         reply = self.wait_for_bot_reply(max_wait_sec=max_wait_sec)
 
-        # If the reply looks like a clarifying question (short, ends with ?),
-        # auto-reply with the original prompt so the topic's Question node gets
-        # its variable filled in and the scoring flow completes.
+        # If the reply looks like a clarifying question, auto-reply with the
+        # extracted payload so the topic's Question node gets its variable filled.
         turns_taken = 1
         while turns_taken < max_turns and self._looks_like_question(reply):
-            # The Question node wants a simple value. Send the original prompt
-            # stripped of its "Score this job posting:" prefix if present.
             follow_up = self._extract_payload(prompt)
             self.send_message(follow_up)
             reply = self.wait_for_bot_reply(max_wait_sec=max_wait_sec)
