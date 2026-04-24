@@ -1,12 +1,17 @@
 """
 Magelli Prospect Identification Dashboard
 Gies College of Business - AI for Impact Buildathon
+LIVE INTEGRATION: calls Copilot Studio agent via Direct Line REST API.
 """
 
 import time
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+from agent_client import CopilotStudioAgent, DirectLineError
+from parser import parse_scorecard
+from file_handler import process_uploaded_file, truncate_text
 
 ILLINI_ORANGE = "#E84A27"
 ILLINI_BLUE = "#13294B"
@@ -517,7 +522,7 @@ def render_header():
             </div>
             <div class="agent-status">
                 <span class="status-dot"></span>
-                <span>Agent: Connected · Claude Opus 4.6</span>
+                <span>Agent: LIVE · Copilot Studio · Claude Opus 4.6</span>
             </div>
         </div>
         """,
@@ -863,28 +868,150 @@ def main():
     with tab1:
         render_kpi_tiles()
 
-        st.markdown('<div class="section-head">Score a posting</div>', unsafe_allow_html=True)
-        col_a, col_b = st.columns([5, 1])
-        with col_a:
-            posting_id = st.text_input(
-                "Posting ID",
-                placeholder="Enter posting ID, e.g. BT-024",
+        st.markdown('<div class="section-head">Score a Job Posting</div>', unsafe_allow_html=True)
+
+        input_mode = st.radio(
+            "Input method",
+            ["Paste text", "Upload file", "Corpus posting ID"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="input_mode",
+        )
+
+        # For each mode, collect (display_id, text_to_send, is_id_lookup)
+        score_target = None
+
+        if input_mode == "Paste text":
+            posting_text = st.text_area(
+                "Job posting text",
+                placeholder=(
+                    "Paste the full job posting here. Include company name, role title, "
+                    "location, and the full description. Example:\n\n"
+                    "NorthStack Partners is hiring a Head of Growth in Peoria, IL. "
+                    "Following recent investment, we are formalizing our growth function "
+                    "and this is the first dedicated leader for the team..."
+                ),
+                height=200,
                 label_visibility="collapsed",
-                key="posting_input",
+                key="posting_text",
             )
-        with col_b:
-            go_btn = st.button("Score", use_container_width=True)
-
-        if go_btn or posting_id:
-            if posting_id:
-                with st.spinner(f"Scoring {posting_id.upper()}..."):
-                    time.sleep(0.8)
-                    scorecard = get_scorecard(posting_id)
-
-                if scorecard:
-                    render_scorecard(scorecard)
+            if st.button("Score this posting", key="score_text_btn"):
+                if posting_text and posting_text.strip():
+                    score_target = ("Pasted posting", posting_text.strip(), False)
                 else:
-                    st.warning(f"No cached scorecard for {posting_id.upper()}. Try BT-024, BT-023, or BT-002.")
+                    st.warning("Please paste a job posting first.")
+
+        elif input_mode == "Upload file":
+            uploaded = st.file_uploader(
+                "Upload a job posting file",
+                type=["xlsx", "xls", "csv", "pdf", "docx", "txt", "md"],
+                label_visibility="collapsed",
+                help="Supports Excel, CSV, PDF, Word, text, and markdown files.",
+                key="posting_upload",
+            )
+
+            if uploaded is not None:
+                try:
+                    result = process_uploaded_file(uploaded.name, uploaded.getvalue())
+                except Exception as e:
+                    st.error(f"Could not read file: {e}")
+                    result = None
+
+                if result and result["mode"] == "multi":
+                    postings = result["postings"]
+                    st.success(f"Loaded {len(postings)} postings from {uploaded.name}")
+
+                    # Let user pick one to score
+                    labels = [p["label"] for p in postings]
+                    pick = st.selectbox(
+                        "Select a posting to score",
+                        options=range(len(postings)),
+                        format_func=lambda i: labels[i],
+                        key="posting_pick",
+                    )
+
+                    with st.expander(f"Preview: {postings[pick]['label']}"):
+                        st.text(postings[pick]["text"][:800])
+
+                    if st.button("Score selected posting", key="score_upload_btn"):
+                        selected = postings[pick]
+                        score_target = (selected["id"] or selected["label"], selected["text"], False)
+
+                elif result and result["mode"] == "single":
+                    st.success(f"Loaded {uploaded.name}")
+                    text = result["text"]
+                    if not text or len(text.strip()) < 50:
+                        st.warning("File appears empty or too short.")
+                    else:
+                        with st.expander(f"Preview ({len(text)} characters)"):
+                            st.text(text[:800])
+                        if st.button("Score this posting", key="score_file_btn"):
+                            score_target = (uploaded.name, text, False)
+
+        else:  # Corpus posting ID
+            col_a, col_b = st.columns([5, 1])
+            with col_a:
+                corpus_id = st.text_input(
+                    "Posting ID",
+                    placeholder="Enter a corpus posting ID, e.g. BT-024",
+                    label_visibility="collapsed",
+                    key="corpus_id_input",
+                )
+            with col_b:
+                if st.button("Score", use_container_width=True, key="score_id_btn"):
+                    if corpus_id and corpus_id.strip():
+                        pid = corpus_id.strip().upper()
+                        score_target = (pid, pid, True)
+                    else:
+                        st.warning("Enter a posting ID first.")
+
+        # ─── Score whatever was set above ────────────────────────────
+        if score_target is not None:
+            display_id, text_to_send, is_id_lookup = score_target
+
+            # Demo safety net — if it's an ID we have cached, render instantly
+            if is_id_lookup:
+                cached = SCORECARDS.get(display_id.upper())
+                if cached:
+                    render_scorecard(cached)
+                    score_target = None  # suppress live call
+
+            if score_target is not None:
+                secret = st.secrets.get("COPILOT_SECRET", "")
+                if not secret:
+                    st.error("Agent secret not configured. Set COPILOT_SECRET in Streamlit Cloud secrets.")
+                else:
+                    spinner_label = (
+                        f"Scoring {display_id} with Copilot Studio agent..."
+                        if is_id_lookup
+                        else "Analyzing the posting with Copilot Studio agent..."
+                    )
+                    with st.spinner(spinner_label):
+                        try:
+                            agent = CopilotStudioAgent(secret)
+                            agent.start_conversation()
+
+                            if is_id_lookup:
+                                prompt = f"score {display_id}"
+                            else:
+                                safe_text = truncate_text(text_to_send, max_chars=4000)
+                                prompt = f"Score this job posting:\n\n{safe_text}"
+
+                            reply = agent.ask(prompt, max_wait_sec=75)
+                            scorecard = parse_scorecard(display_id, reply)
+                            if scorecard["final_score"] == 0:
+                                st.warning(
+                                    "Agent responded but I couldn't parse a score cleanly. Raw output below."
+                                )
+                                st.code(reply, language="markdown")
+                            else:
+                                render_scorecard(scorecard)
+                                with st.expander("Raw agent response"):
+                                    st.code(reply, language="markdown")
+                        except DirectLineError as e:
+                            st.error(f"Agent call failed: {e}")
+                        except Exception as e:
+                            st.error(f"Unexpected error: {type(e).__name__}: {e}")
 
     with tab2:
         render_coverage_map()
