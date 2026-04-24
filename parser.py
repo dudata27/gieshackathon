@@ -20,76 +20,96 @@ from typing import Optional
 
 def _find_score(text: str) -> Optional[int]:
     """Extract the final score (0-100) from the response."""
-    # Look for patterns like "Score: 98", "Final Score 98", "98/100", "98 / 100"
+    # Strip markdown asterisks for easier matching
+    cleaned = text.replace("**", "").replace("__", "")
+
     patterns = [
-        r"(?i)final\s*score[:\s]*\|?\s*\**\s*(\d{1,3})",
-        r"(?i)clipped\s*(?:to\s*\d+[\-–]\d+)?[:\s]*\|?\s*\**\s*(\d{1,3})",
+        r"(?i)fit\s*score[:\s]*(\d{1,3})\s*/\s*100",
         r"(?i)fit\s*score[:\s]*(\d{1,3})",
-        r"(?i)score[:\s]+(\d{1,3})(?:\s*/\s*100)?\s*\**\s*$",
-        r"Score:\s*(\d{1,3})",
+        r"(?i)final\s*score[:\s]*(\d{1,3})",
+        r"(?i)final[^a-z]*?(\d{1,3})\s*/\s*100",
+        r"(?i)clipped\s*(?:to\s*)?(?:\d+[\-–]\d+[:\s]*)?(\d{1,3})\b",
+        r"(?i)new\s*score[:\s]*(\d{1,3})",
+        r"(?i)score[:\s]+(\d{1,3})(?:\s*/\s*100)",
+        r"=\s*\d+\s*(?:→|->)\s*clipped\s*to\s*(\d{1,3})",
+        r"(?i)^\s*score[:\s]+(\d{1,3})\s*$",
     ]
     for p in patterns:
-        m = re.search(p, text, re.MULTILINE)
+        m = re.search(p, cleaned, re.MULTILINE)
         if m:
             val = int(m.group(1))
-            if 0 <= val <= 100:
+            if 18 <= val <= 100:  # must be within clipped range
                 return val
     return None
 
 
 def _find_tier(text: str) -> Optional[str]:
     """Extract tier letter (A/B/C/D)."""
-    m = re.search(r"(?i)tier[:\s]*\**\s*([ABCD])\b", text)
-    if m:
-        return m.group(1).upper()
+    cleaned = text.replace("**", "").replace("__", "")
+    patterns = [
+        r"(?i)tier[:\s]+([ABCD])\b",
+        r"(?i)new\s*tier[:\s]+([ABCD])\b",
+    ]
+    for p in patterns:
+        m = re.search(p, cleaned)
+        if m:
+            return m.group(1).upper()
     return None
 
 
 def _find_flagged(text: str) -> Optional[bool]:
     """Extract flagged status."""
-    # Positive patterns
-    pos = [
-        r"(?i)flagged.{0,20}yes",
-        r"(?i)flagged\s*for\s*outreach[^\n]*[:\s]*\**\s*(?:yes|✓|true)",
-        r"(?i)outreach[:\s]*\**\s*(?:yes|flagged)",
-        r"✔.*?[Ff]lagged",
-    ]
+    cleaned = text.replace("**", "").replace("__", "")
+    # Negative patterns first (they're more specific)
     neg = [
         r"(?i)not\s*flagged",
-        r"(?i)flagged[^\n]*[:\s]*\**\s*no",
-        r"(?i)outreach[:\s]*\**\s*no",
-        r"✗\s*[Nn]ot",
+        r"(?i)flagged[^\n]*[:\s]+no\b",
+        r"(?i)outreach[:\s]+(?:not\s*flagged|no\b)",
+        r"✗",
     ]
     for p in neg:
-        if re.search(p, text):
+        if re.search(p, cleaned):
             return False
+    # Positive patterns
+    pos = [
+        r"(?i)flagged\s*for\s*outreach",
+        r"(?i)outreach[:\s]*flagged",
+        r"(?i)flagged[:\s]*yes",
+        r"✔|✓",
+    ]
     for p in pos:
-        if re.search(p, text):
+        if re.search(p, cleaned):
             return True
     return None
 
 
 def _find_company(text: str) -> Optional[str]:
     """Extract company name."""
-    # Usually appears early, before 'Head of' or '|' or role title
     lines = text.strip().split("\n")
-    for line in lines[:15]:
+    for line in lines[:20]:
         line = line.strip().lstrip("#").strip()
         if not line:
             continue
-        # Skip markdown table borders
-        if line.startswith("|") or line.startswith("---"):
+        # Skip separator lines (=====, ----, ....)
+        if set(line) <= set("=-_. \t"):
             continue
-        # Pattern: "CompanyName | RoleName"
-        if "|" in line:
-            part = line.split("|")[0].strip().lstrip("*").rstrip("*").strip()
-            if part and len(part) < 60 and "score" not in part.lower():
+        # Skip markdown table borders
+        if line.startswith("|") and line.count("|") > 2:
+            continue
+        # Skip section headers
+        if line.upper() in ("SIGNALS", "FIT BREAKDOWN", "SCORE MATH", "RATIONALE", "HEADER", "RECOMMENDED OWNER"):
+            continue
+        # Pattern: "**CompanyName** | RoleName" or "CompanyName | RoleName"
+        clean_line = line.replace("**", "").replace("__", "").strip()
+        if "|" in clean_line:
+            part = clean_line.split("|")[0].strip()
+            if part and len(part) < 80 and "score" not in part.lower() and "[" not in part:
                 return part
-        # Pattern: "**CompanyName**"
-        bold_match = re.match(r"\*\*([^*]+)\*\*", line)
+        # Pattern: just "**CompanyName**" on its own line
+        bold_match = re.match(r"^\*\*([^*]+)\*\*\s*$", line)
         if bold_match:
             candidate = bold_match.group(1).strip()
-            if len(candidate) < 60:
+            if len(candidate) < 80 and "[" not in candidate:
                 return candidate
     return None
 
@@ -97,13 +117,18 @@ def _find_company(text: str) -> Optional[str]:
 def _find_role(text: str) -> Optional[str]:
     """Extract role title."""
     lines = text.strip().split("\n")
-    for line in lines[:15]:
+    for line in lines[:20]:
         line = line.strip().lstrip("#").strip()
-        if "|" in line:
-            parts = line.split("|")
+        if not line:
+            continue
+        if set(line) <= set("=-_. \t"):
+            continue
+        clean_line = line.replace("**", "").replace("__", "").strip()
+        if "|" in clean_line:
+            parts = clean_line.split("|")
             if len(parts) >= 2:
-                role = parts[1].strip().lstrip("*").rstrip("*").strip()
-                if role and len(role) < 80:
+                role = parts[1].strip()
+                if role and len(role) < 120 and "[" not in role:
                     return role
     # Fallback: look for common titles
     titles = ["Head of", "Director of", "VP", "Chief", "Manager", "Lead"]
@@ -178,38 +203,48 @@ def _find_posting_age(text: str) -> int:
 def _extract_signal(text: str, signal_name: str) -> tuple:
     """
     Extract (value, quote, confidence) for a named signal.
-    signal_name like 'First Strategic Hire', 'Cluster Hiring', 'New Initiative'
+    Handles markdown bold formatting: 'First strategic hire: **Yes** — High confidence'
+    followed by 'Quote: "..."' on the next line.
     """
-    # Build a pattern that matches the signal header and captures everything until
-    # the next signal or section.
-    sig_alias = {
-        "First Strategic Hire": ["first strategic hire", "first.{0,10}hire"],
+    # Strip markdown asterisks
+    cleaned = text.replace("**", "")
+
+    sig_aliases = {
+        "First Strategic Hire": ["first strategic hire", "first.hire", "first dedicated"],
         "Cluster Hiring": ["cluster hiring", "cluster"],
         "New Initiative": ["new initiative", "initiative"],
     }
-    aliases = sig_alias.get(signal_name, [signal_name.lower()])
+    aliases = sig_aliases.get(signal_name, [signal_name.lower()])
 
     for alias in aliases:
-        # Look for "SignalName: Yes — High confidence" or similar
-        pattern = rf"(?is){alias}[:\s]*\**\s*(Yes|No)[^\n]*?(?:(High|Medium|Low)\s*confidence)?(.*?)(?=\n\s*\n|\n\s*[0-9]\.|\n\s*(?:cluster|new\s*initiative|industry\s*fit|fit\s*assessment|score\s*math|\Z))"
-        m = re.search(pattern, text, re.DOTALL)
+        # Match: "<alias>: Yes — High confidence" then optionally a quote
+        # Use re.IGNORECASE | re.DOTALL, stop at next blank line or next signal
+        pattern = (
+            rf"(?is)\b{alias}\s*[:\-]?\s*"             # header
+            rf"(Yes|No)\s*"                            # value
+            rf"[^\n]*?"                                # dash/em-dash filler
+            rf"(High|Medium|Low)?\s*confidence?"       # optional confidence
+            rf"(.*?)"                                  # body with quote
+            rf"(?=\n\s*(?:Cluster|New\s*initiative|Industry\s*fit|Fit|FIT|Score|SCORE|Tier|TIER|Rationale|RATIONALE|Recommended|RECOMMENDED|\Z))"
+        )
+        m = re.search(pattern, cleaned)
         if m:
             value = m.group(1).capitalize()
             confidence = (m.group(2) or "High").capitalize()
-            rest = m.group(3) or ""
-            # Extract first quoted string or block-quoted line
-            quote = _extract_quote(rest)
+            body = m.group(3) or ""
+            quote = _extract_quote(body)
             return value, quote, confidence
     return "No", "", "Medium"
 
 
 def _extract_quote(text: str) -> str:
     """Find a quoted passage in the text."""
-    # Try common quote patterns
+    # Try quote patterns in order
     patterns = [
-        r'"([^"]{20,500})"',  # double quotes
-        r'"([^"]{20,500})"',  # smart quotes
-        r'>\s*([^\n]{20,500})',  # markdown blockquote
+        r'Quote\s*:\s*"([^"]{10,800})"',   # "Quote: "...""
+        r'"([^"]{20,800})"',                # plain double quotes
+        r'"([^"]{20,800})"',                # smart quotes
+        r'>\s*([^\n]{20,800})',             # blockquote
     ]
     for p in patterns:
         m = re.search(p, text)
@@ -237,37 +272,71 @@ def _find_fit(text: str, axis: str, default: str) -> str:
 
 def _extract_math(text: str) -> tuple:
     """Extract score math components and raw total."""
+    cleaned = text.replace("**", "").replace("__", "")
     rows = []
     raw_total = 0
 
-    # Find lines like "First strategic hire (Yes)  +19" or "Baseline  22"
+    # Component-wise extraction: grab the FIRST signed number after the label,
+    # not crossing past another component keyword.
+    # Each pattern: <label> ... <possibly sign><digits> ... before next keyword
     candidates = [
-        ("Baseline", r"baseline[:\s]*\**\s*(\d+)"),
-        ("First strategic hire", r"first[^+\-]*?([+\-]?\d+)"),
-        ("Cluster hiring", r"cluster[^+\-]*?([+\-]?\d+)"),
-        ("New initiative", r"(?:new\s*)?initiative[^+\-]*?([+\-]?\d+)"),
-        ("Industry fit", r"industry\s*fit[^+\-]*?([+\-]?\d+)"),
-        ("Geography fit", r"geography\s*fit[^+\-]*?([+\-]?\d+)"),
-        ("Program fit", r"program\s*fit[^+\-]*?([+\-]?\d+)"),
-        ("Age decay", r"(?:age|posting)\s*decay[^+\-]*?([+\-]?\d+)"),
+        ("Baseline", r"baseline\s*\+?(\d{1,2})"),
+        ("First strategic hire", r"first(?:\s*strategic)?\s*hire(?:[^+\-]{0,15})([+\-]\d{1,2}|\b\d{1,2}\b)"),
+        ("Cluster hiring", r"cluster(?:\s*hiring)?(?:[^+\-]{0,15})([+\-]\d{1,2}|\b\d{1,2}\b)"),
+        ("New initiative", r"new\s*initiative(?:[^+\-]{0,15})([+\-]\d{1,2}|\b\d{1,2}\b)"),
+        ("Industry fit", r"industry(?:[^+\-]{0,25})([+\-]\d{1,2}|\b\d{1,2}\b)"),
+        ("Geography fit", r"geography(?:[^+\-]{0,25})([+\-]\d{1,2}|\b\d{1,2}\b)"),
+        ("Program fit", r"program(?:[^+\-]{0,25})([+\-]\d{1,2}|\b\d{1,2}\b)"),
+        ("Age decay", r"age\s*decay\s*([+\-]?\d{1,2})(?=\s|$|=|\+)"),
     ]
 
     for label, pattern in candidates:
-        m = re.search(pattern, text, re.IGNORECASE)
+        m = re.search(pattern, cleaned, re.IGNORECASE)
         if m:
+            raw_val = m.group(1).strip()
+            if raw_val.startswith("+"):
+                raw_val = raw_val[1:]
             try:
-                val = int(m.group(1))
+                val = int(raw_val)
+                # Sanity: baseline is 22, most others 0-19. If we got 22 for non-baseline, skip
+                if label != "Baseline" and val == 22:
+                    continue
                 rows.append((label, val))
                 raw_total += val
             except ValueError:
                 pass
 
-    # Look for explicit "Raw total" in the text
-    m = re.search(r"(?i)raw\s*total[:\s]*\**\s*(\d+)", text)
+    # Prefer explicit "Raw total: N" if present
+    m = re.search(r"(?i)raw\s*total[:\s]+\+?(\d+)", cleaned)
     if m:
         raw_total = int(m.group(1))
+    else:
+        # Fall back to "= N" or "= N → clipped" pattern
+        m = re.search(r"=\s*\+?(\d+)\s*(?:→|->)", cleaned)
+        if m:
+            raw_total = int(m.group(1))
 
     return rows, raw_total
+
+
+def _extract_rationale(text: str) -> str:
+    """Extract rationale block."""
+    cleaned = text.replace("**", "")
+    # Match Rationale section: header line, then body until Recommended Owner or end
+    m = re.search(
+        r"(?is)rationale\s*\n+(.*?)(?=\n\s*(?:recommended|owner|\Z))",
+        cleaned,
+    )
+    if m:
+        rat = m.group(1).strip()
+        # Take first 2 sentences max
+        sentences = re.split(r'(?<=[.!?])\s+', rat)
+        return " ".join(sentences[:2])
+    # Fallback: single-line "RATIONALE: ..." pattern
+    m = re.search(r"(?i)rationale[:\s]+([^\n]{20,600})", cleaned)
+    if m:
+        return m.group(1).strip()
+    return "Scored against Magelli consulting-fit rubric."
 
 
 def parse_scorecard(posting_id: str, agent_text: str) -> dict:
@@ -325,17 +394,6 @@ def parse_scorecard(posting_id: str, agent_text: str) -> dict:
         "recommended_owner": _recommended_owner(flagged, tier, state in midwest_states),
         "raw_response": agent_text,  # keep for display fallback
     }
-
-
-def _extract_rationale(text: str) -> str:
-    """Extract rationale block."""
-    m = re.search(r"(?is)rationale[:\s]*\**\s*\n?(.*?)(?=\n\s*(?:recommended|owner|$))", text)
-    if m:
-        rat = m.group(1).strip()
-        # Take first 2 sentences max
-        sentences = re.split(r'(?<=[.!?])\s+', rat)
-        return " ".join(sentences[:2])
-    return "Scored against Magelli consulting-fit rubric."
 
 
 def _recommended_owner(flagged: bool, tier: str, in_midwest: bool) -> str:
