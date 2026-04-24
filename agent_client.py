@@ -99,18 +99,16 @@ class CopilotStudioAgent:
         user_id: str = "streamlit-user",
         max_wait_sec: int = 45,
         poll_interval_sec: float = 1.0,
+        stop_on_question: bool = True,
     ) -> str:
         """
         Poll for bot responses until we get one or timeout.
         Returns the concatenated text of all bot messages.
+        If stop_on_question=False, keep collecting past short question-style replies.
         """
         end_at = time.time() + max_wait_sec
         collected = []
         saw_bot_reply = False
-
-        # The bot typically sends 2+ activities: a typing indicator, then message(s).
-        # We wait for at least one 'message' activity from someone other than us
-        # that has text content. Then grab a little more in case of multi-part.
 
         while time.time() < end_at:
             activities = self.get_activities()
@@ -147,12 +145,71 @@ class CopilotStudioAgent:
 
         return "\n\n".join(collected)
 
-    def ask(self, prompt: str, max_wait_sec: int = 45) -> str:
-        """Send a prompt, wait for the bot's reply, return the text."""
+    def ask(self, prompt: str, max_wait_sec: int = 45, max_turns: int = 3) -> str:
+        """
+        Send a prompt, wait for the bot's reply.
+        Handles multi-turn: if bot asks a clarifying question, we auto-reply with
+        the original prompt so the flow completes.
+        """
         if not self.conversation_id:
             self.start_conversation()
+
+        # First turn
         self.send_message(prompt)
-        return self.wait_for_bot_reply(max_wait_sec=max_wait_sec)
+        reply = self.wait_for_bot_reply(max_wait_sec=max_wait_sec)
+
+        # If the reply looks like a clarifying question (short, ends with ?),
+        # auto-reply with the original prompt so the topic's Question node gets
+        # its variable filled in and the scoring flow completes.
+        turns_taken = 1
+        while turns_taken < max_turns and self._looks_like_question(reply):
+            # The Question node wants a simple value. Send the original prompt
+            # stripped of its "Score this job posting:" prefix if present.
+            follow_up = self._extract_payload(prompt)
+            self.send_message(follow_up)
+            reply = self.wait_for_bot_reply(max_wait_sec=max_wait_sec)
+            turns_taken += 1
+
+        return reply
+
+    def _looks_like_question(self, text: str) -> bool:
+        """Heuristic: short text ending in ? or asking for posting input."""
+        if not text:
+            return False
+        stripped = text.strip()
+        if len(stripped) > 400:
+            return False  # probably the full scorecard, not a question
+        lower = stripped.lower()
+        question_markers = [
+            "which posting",
+            "what posting",
+            "enter the posting",
+            "provide a posting",
+            "by how much",
+            "how much should",
+        ]
+        if any(m in lower for m in question_markers):
+            return True
+        if stripped.endswith("?") and len(stripped) < 250:
+            return True
+        return False
+
+    def _extract_payload(self, prompt: str) -> str:
+        """Strip 'Score this job posting:' prefix if present, to send cleaner follow-up."""
+        prefixes = [
+            "Score this job posting:",
+            "score this job posting:",
+            "Score this posting:",
+            "score this posting:",
+            "Explain the score for:",
+            "score ",
+            "explain ",
+            "override ",
+        ]
+        for p in prefixes:
+            if prompt.startswith(p):
+                return prompt[len(p):].strip()
+        return prompt.strip()
 
     def close(self):
         self.conversation_id = None
